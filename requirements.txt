@@ -15,7 +15,7 @@ curl_cffi>=0.7.0
 #      cloakbrowser → app.py warm-pool path (launch_async)
 #      playwright   → kontolsolver.py chromium transport (sync_playwright)
 playwright>=1.40.0
-cloakbrowser==0.7.0
+cloakbrowser==0.6.5
 
 # ── Plain HTTP client (tester.py) ────────────────────────────
 requests>=2.31.0
