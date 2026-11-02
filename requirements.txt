@@ -10,8 +10,13 @@ werkzeug>=3.0.0
 # ── HTTP client with browser impersonation (app.py) ──────────
 curl_cffi>=0.7.0
 
-# ── Headless browser automation (app.py WAF solver) ──────────
+# ── Headless browser automation ──────────────────────────────
+#    BOTH are needed:
+#      cloakbrowser → app.py warm-pool path (launch_async)
+#      playwright   → kontolsolver.py chromium transport (sync_playwright)
+playwright>=1.40.0
 cloakbrowser==0.7.0
+
 # ── Plain HTTP client (tester.py) ────────────────────────────
 requests>=2.31.0
 
@@ -22,9 +27,8 @@ charset-normalizer>=3.0.0
 idna>=3.4
 
 # ── Optional: player info lookup (info.py) ───────────────────
-# Uncomment if you use --show-info:
-aiohttp>=3.9.0
-websockets>=12.0
+# aiohttp>=3.9.0
+# websockets>=12.0
 
-# ── Optional: faster async (not required, used by cloakbrowser) ──
-asyncio>=3.4.3        # only needed on very old Python
+# ── Optional: faster async (not required) ────────────────────
+# asyncio>=3.4.3
