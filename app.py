@@ -1883,8 +1883,11 @@ def _interactive_setup():
 if __name__ == '__main__':
     import argparse
     ap = argparse.ArgumentParser()
-    ap.add_argument('--port', type=int, default=5555)
-    ap.add_argument('--host', default='127.0.0.1')
+
+    _default_port = int(os.environ.get('PORT', '5555'))
+    _default_host = os.environ.get('HOST', '127.0.0.1')
+    ap.add_argument('--port', type=int, default=_default_port)
+    ap.add_argument('--host', default=_default_host)
     ap.add_argument('--proxies', default='proxies.txt',
                     help='Path to proxy list (user:pass@host:port per line)')
     ap.add_argument('--tokens', default=None,
