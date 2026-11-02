@@ -353,7 +353,16 @@ def _ensure_waf_loop():
 async def _get_waf_browser():
     global _waf_browser
     if _waf_browser is None:
-        _waf_browser = await launch_async(headless=True, humanize=True)
+        license_key = os.environ.get('CLOAKBROWSER_LICENSE_KEY')
+        if not license_key:
+            raise RuntimeError("cloakbrowser_license_missing: set CLOAKBROWSER_LICENSE_KEY")
+        _waf_browser = await launch_async(
+            license_key=license_key,
+            headless=True,
+            humanize=True,
+            human_preset="careful",
+            geoip=bool(PROXIES),
+        )
     return _waf_browser
 
 async def _make_warm_page(browser):
