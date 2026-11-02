@@ -11,8 +11,7 @@ werkzeug>=3.0.0
 curl_cffi>=0.7.0
 
 # ── Headless browser automation (app.py WAF solver) ──────────
-cloakbrowser>=1.0.0
-
+cloakbrowser==0.7.0
 # ── Plain HTTP client (tester.py) ────────────────────────────
 requests>=2.31.0
 
