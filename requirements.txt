@@ -1,5 +1,31 @@
-python-telegram-bot>=21.0
-pycryptodome==3.20.0
-zstandard==0.23.0
-cffi>=1.17.1
+# ============================================================
+#  MLBB WAF Solver + Tester — requirements.txt
+#  Install with:  pip install -r requirements.txt
+# ============================================================
+
+# ── Core web framework (app.py) ──────────────────────────────
+flask>=3.0.0
+werkzeug>=3.0.0
+
+# ── HTTP client with browser impersonation (app.py) ──────────
+curl_cffi>=0.7.0
+
+# ── Headless browser automation (app.py WAF solver) ──────────
+cloakbrowser>=1.0.0
+
+# ── Plain HTTP client (tester.py) ────────────────────────────
 requests>=2.31.0
+
+# ── requests dependencies (usually auto-installed) ───────────
+urllib3>=2.0.0
+certifi>=2023.7.22
+charset-normalizer>=3.0.0
+idna>=3.4
+
+# ── Optional: player info lookup (info.py) ───────────────────
+# Uncomment if you use --show-info:
+# aiohttp>=3.9.0
+# websockets>=12.0
+
+# ── Optional: faster async (not required, used by cloakbrowser) ──
+# asyncio>=3.4.3        # only needed on very old Python
