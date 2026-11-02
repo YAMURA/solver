@@ -24,8 +24,8 @@ idna>=3.4
 
 # ── Optional: player info lookup (info.py) ───────────────────
 # Uncomment if you use --show-info:
-# aiohttp>=3.9.0
-# websockets>=12.0
+aiohttp>=3.9.0
+websockets>=12.0
 
 # ── Optional: faster async (not required, used by cloakbrowser) ──
-# asyncio>=3.4.3        # only needed on very old Python
+asyncio>=3.4.3        # only needed on very old Python
